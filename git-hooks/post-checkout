@@ -1,0 +1,117 @@
+#!/usr/bin/env pwsh
+#
+# Requires Powershell Core - pwsh
+#
+# Creates branch specific virtual envs and a well known symlink
+# to them each time a branch is changed.
+#
+
+Param (
+    [string] $previousHead,
+    [string] $newHead,
+    [int] $isBranch
+)
+
+Set-ExecutionPolicy RemoteSigned
+
+if ($isBranch -eq 0) {
+    # We only support chaning branches at the moment
+    exit 0
+}
+
+$python = "python"
+$pip = "pip"
+
+# Root folder to store all branch virtual envs
+$venvsFolderName = "OpenCue-venvs"
+
+# Requirement files to install, paths relative to repo root
+$requirements = @("requirements.txt", "requirements_gui.txt")
+
+# Projects to install, paths relative to repo root
+$projects_to_install = @("pycue/setup.py", "pyoutline/setup.py", "cuesubmit/setup.py", "cuegui/setup.py", "rqd/setup.py")
+
+
+$ref = git reflog | select-object -first 1 | Out-string
+$tokens = $ref -Split " "
+$previousBranch = $tokens[5]
+$newBranch = $tokens[7].Trim()
+$repoRoot = git rev-parse --show-toplevel
+
+$venvsRoot = Join-Path -Path (Get-Item $repoRoot).Parent.FullName -ChildPath $venvsFolderName
+
+Write-Output ""
+Write-Output "Switching to branch $newBranch ($newHead)"
+
+$branchVenv = Join-Path -Path $venvsRoot -ChildPath $newBranch
+New-Item -ItemType Directory -Force -Path $venvsRoot | Out-Null
+
+function Branch-Initialized {
+    $initMarker = "$branchVenv/init-sha.txt"
+    if ([System.IO.File]::Exists($initMarker)) {
+        $sha = (Get-Content -Path $initMarker)
+        if ($newHead -eq $sha) {
+            Write-Output "virtualenv already initialized"
+            return $True
+        }
+    }
+    return $False
+}
+
+function Create-VirtualEnv {
+    if(![System.IO.Directory]::Exists($branchVenv)){
+        Write-Output "Creating a new virtual env in $branchVenv"
+        virtualenv $branchVenv
+    }
+
+    & "$branchVenv/Scripts/Activate.ps1"
+}
+
+if (-Not (Branch-Initialized)) {
+
+    # Create a virtual env for the branch and activate
+    Create-VirtualEnv
+
+    # Install all the PyPi dependencies
+    Write-Output "Installing PyPi requirements"
+    
+    foreach ($requirement in $requirements) {
+        & $pip install --upgrade -r "$repoRoot/${requirement}" | Out-Null
+    }
+
+    # Compile the Python gRPC
+    Write-Output "Generating protobufs"
+    New-Item -ItemType Directory -Force -Path "$repoRoot/pycue/opencue/compiled_proto" | Out-Null
+    Get-ChildItem -Path "$repoRoot/proto" -Filter *.proto -File -Name | ForEach-Object {
+        & $python -m grpc_tools.protoc -I="$repoRoot/proto" --python_out="$repoRoot/pycue/opencue/compiled_proto" --grpc_python_out="$repoRoot/pycue/opencue/compiled_proto" $_
+    }
+
+    # Convert the Python protobufs from Py2 => Py3
+    ls "$repoRoot/pycue/opencue/compiled_proto/*.py" | %{(cat $_) -Replace 'import.*pb2','from . $0' | Out-File $_ -Encoding ASCII}
+
+    # Copy the compiled protobufs to RQD
+    New-Item -ItemType Directory -Force -Path "$repoRoot/rqd/rqd/compiled_proto" | Out-Null
+    Copy-Item -Path "$repoRoot/pycue/opencue/compiled_proto/*" -Destination "$repoRoot/rqd/rqd/compiled_proto/" -Recurse
+
+    # Install each project
+    Write-Output "Installing projects"
+    foreach ($project in $projects_to_install) {
+        & $python "$repoRoot/$project" install
+    }
+
+    # Write the commit hash to a marker file
+    $newHead | Out-File "$branchVenv/init-sha.txt"
+}
+
+$linkVenv = Join-Path -Path $venvsRoot -ChildPath "venv"
+
+if ([System.IO.Directory]::Exists($branchVenv)) {
+    # Remove the Symlink if it already exists
+    Remove-Item $linkVenv -Force
+}
+
+# Create a symlink from 'venv' to the branch specific venv so the PyCharm
+# interpretor doesn't change.
+cmd.exe /c mklink /D $linkVenv $branchVenv
+
+exit 0
